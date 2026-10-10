@@ -40,7 +40,8 @@ list_vms() {
 }
 
 destroy_one() {
-  local name="$1" dir="$STATE_ROOT/$name" pid="" port=""
+  local name="$1" pid="" port=""
+  local dir="$STATE_ROOT/$name"
   [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$ ]] || die "Invalid VM name: $name"
   [[ -d "$dir" ]] || { echo "No instance named '$name'."; return 1; }
   [[ -f "$dir/port" ]] && port="$(<"$dir/port")"
