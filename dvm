@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+# Start a disposable Ubuntu cloud VM and connect to it over SSH in this terminal.
+# VMs persist after SSH disconnects; use dvm-shred to destroy them.
+
+CLOUD_IMG_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+MEMORY_MIB="${DVM_MEMORY_MIB:-3072}"
+VCPUS="${DVM_VCPUS:-2}"
+DISK_SIZE="${DVM_DISK_SIZE:-10G}"
+PORT_START="${DVM_PORT_START:-2226}"
+PORT_END="${DVM_PORT_END:-2299}"
+STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/dvm"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/disposable-vm"
+BASE_IMG="$CACHE_DIR/noble-server-cloudimg-amd64.img"
+STARTUP_OK=0
+RUN_DIR=""
+QEMU_PID=""
+
+log() { printf '[dvm] %s\n' "$*"; }
+die() { printf '[dvm] ERROR: %s\n' "$*" >&2; exit 1; }
+
+cleanup_failed_start() {
+  local rc=$?
+  if (( ! STARTUP_OK )); then
+    if [[ -n "$QEMU_PID" ]] && kill -0 "$QEMU_PID" 2>/dev/null; then
+      kill -TERM "$QEMU_PID" 2>/dev/null || true
+      sleep 1
+      kill -KILL "$QEMU_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$RUN_DIR" && -d "$RUN_DIR" ]]; then
+      rm -rf -- "$RUN_DIR"
+    fi
+  fi
+  exit "$rc"
+}
+trap cleanup_failed_start EXIT
+
+for cmd in wget qemu-img qemu-system-x86_64 cloud-localds ssh ssh-keygen flock ss timeout; do
+  command -v "$cmd" >/dev/null 2>&1 || die "Required command not found: $cmd"
+done
+[[ -r /dev/kvm && -w /dev/kvm ]] || die "Cannot access /dev/kvm as this user. Check KVM permissions; do not run dvm with sudo."
+
+if [[ $# -gt 2 ]]; then
+  die "Usage: dvm [instance-name] [path-to-ssh-public-key]"
+fi
+
+# Short generated name unless one is supplied.
+if [[ $# -ge 1 && -n "${1:-}" ]]; then
+  VM_NAME="$1"
+else
+  VM_NAME="u-$(date +%m%d-%H%M%S)-$$"
+fi
+[[ "$VM_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$ ]] || die "Instance name must be 1-40 characters: letters, digits, _ or -."
+if [[ $# -eq 2 ]]; then
+  PUBKEY_PATH="${2/#\~/$HOME}"
+else
+  PUBKEY_PATH="$HOME/.ssh/id_ed25519.pub"
+fi
+[[ -f "$PUBKEY_PATH" ]] || die "SSH public key not found: $PUBKEY_PATH. Create one with 'ssh-keygen -t ed25519' or pass a public-key path."
+PUBKEY="$(<"$PUBKEY_PATH")"
+[[ "$PUBKEY" == ssh-* || "$PUBKEY" == ecdsa-* ]] || die "Not an OpenSSH public key: $PUBKEY_PATH"
+
+mkdir -p -- "$STATE_ROOT" "$CACHE_DIR"
+chmod 700 "$STATE_ROOT" "$CACHE_DIR"
+RUN_DIR="$STATE_ROOT/$VM_NAME"
+mkdir "$RUN_DIR" 2>/dev/null || die "Instance '$VM_NAME' already exists. List instances with 'dvm-shred --list'; choose another name or destroy the existing instance."
+chmod 700 "$RUN_DIR"
+
+# Serialize only image refreshes, not the lifetime of each VM.
+BASE_LOCK="$CACHE_DIR/image.lock"
+exec 9>"$BASE_LOCK"
+flock 9
+log "Checking cached Ubuntu 24.04 LTS image..."
+if ! wget --https-only --timestamping --directory-prefix="$CACHE_DIR" "$CLOUD_IMG_URL"; then
+  die "Image download/update check failed. Check network access and that $CACHE_DIR is writable."
+fi
+[[ -s "$BASE_IMG" && -r "$BASE_IMG" ]] || die "Ubuntu base image is missing or unreadable: $BASE_IMG"
+flock -u 9
+exec 9>&-
+
+# Reserve a free loopback SSH-forwarding port under a global allocation lock.
+exec 8>"$STATE_ROOT/.ports.lock"
+flock 8
+PORT=""
+for (( candidate=PORT_START; candidate<=PORT_END; candidate++ )); do
+  [[ "$candidate" =~ ^[0-9]+$ ]] || continue
+  if ss -H -ltn "sport = :$candidate" | grep -q .; then
+    continue
+  fi
+  used=0
+  while IFS= read -r port_file; do
+    [[ -f "$port_file" ]] || continue
+    if [[ "$(<"$port_file")" == "$candidate" ]]; then used=1; break; fi
+  done < <(find "$STATE_ROOT" -mindepth 2 -maxdepth 2 -type f -name port -print 2>/dev/null)
+  if (( ! used )); then PORT="$candidate"; break; fi
+done
+[[ -n "$PORT" ]] || die "No free SSH ports in range $PORT_START-$PORT_END. Set DVM_PORT_START/DVM_PORT_END to another range."
+printf '%s\n' "$PORT" > "$RUN_DIR/port"
+flock -u 8
+exec 8>&-
+
+DISK_PATH="$RUN_DIR/disk.qcow2"
+USER_DATA="$RUN_DIR/user-data"
+SEED_ISO="$RUN_DIR/seed.iso"
+QEMU_LOG="$RUN_DIR/qemu.log"
+SERIAL_LOG="$RUN_DIR/serial.log"
+PID_FILE="$RUN_DIR/qemu.pid"
+KNOWN_HOSTS="$RUN_DIR/known_hosts"
+
+log "Creating instance '$VM_NAME' on SSH port $PORT..."
+qemu-img create -f qcow2 -F qcow2 -b "$BASE_IMG" "$DISK_PATH" "$DISK_SIZE" >/dev/null
+
+cat > "$USER_DATA" <<EOF_CLOUD
+#cloud-config
+users:
+  - default
+ssh_pwauth: false
+disable_root: true
+ssh_authorized_keys:
+  - ${PUBKEY}
+write_files:
+  - path: /etc/ssh/sshd_config.d/99-disposable-vm.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      PasswordAuthentication no
+      PermitRootLogin no
+package_update: true
+package_upgrade: true
+packages:
+  - ufw
+runcmd:
+  - [ufw, default, deny, incoming]
+  - [ufw, default, allow, outgoing]
+  - [ufw, allow, OpenSSH]
+  - [ufw, --force, enable]
+  - [bash, -lc, "systemctl disable --now cups.service avahi-daemon.service 2>/dev/null || true"]
+EOF_CLOUD
+chmod 600 "$USER_DATA"
+cloud-localds "$SEED_ISO" "$USER_DATA"
+
+# QEMU user-mode NAT like the working Fedora launcher; SSH is loopback-only.
+qemu-system-x86_64 \
+  -enable-kvm \
+  -machine q35,accel=kvm \
+  -cpu host \
+  -smp "$VCPUS" \
+  -m "${MEMORY_MIB}M" \
+  -drive "file=$DISK_PATH,if=virtio,format=qcow2,cache=none,discard=unmap" \
+  -drive "file=$SEED_ISO,media=cdrom,readonly=on" \
+  -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${PORT}-:22" \
+  -device virtio-net-pci,netdev=net0 \
+  -device virtio-rng-pci \
+  -rtc clock=host,base=utc \
+  -boot order=c,menu=off \
+  -display none \
+  -serial "file:$SERIAL_LOG" \
+  -monitor none \
+  -no-reboot \
+  -daemonize \
+  -pidfile "$PID_FILE" \
+  >"$QEMU_LOG" 2>&1 || die "QEMU failed to start. Inspect $QEMU_LOG"
+
+[[ -s "$PID_FILE" ]] || die "QEMU did not create its PID file. Inspect $QEMU_LOG"
+QEMU_PID="$(<"$PID_FILE")"
+sleep 1
+if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+  cat "$QEMU_LOG" >&2 || true
+  die "QEMU exited during startup. Inspect $QEMU_LOG"
+fi
+
+# State is now a managed, independently disposable VM. Do not delete it on SSH exit.
+STARTUP_OK=1
+log "VM '$VM_NAME' is running. Waiting for the guest SSH service on 127.0.0.1:$PORT (up to 240 seconds)..."
+SSH_READY=0
+
+# A TCP listener alone is not enough: QEMU's port forward can accept a
+# connection before sshd inside the guest is ready. Wait for the SSH protocol
+# banner so the first interactive connection does not fail during banner exchange.
+ssh_banner_ready() {
+  PORT="$PORT" timeout 2 bash -c '
+    exec 3<>"/dev/tcp/127.0.0.1/$PORT" || exit 1
+    IFS= read -r -t 1 banner <&3 || exit 1
+    [[ "$banner" == SSH-* ]]
+  ' >/dev/null 2>&1
+}
+
+for _ in {1..120}; do
+  if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+    log "QEMU exited before SSH became available. Log: $QEMU_LOG"
+    exit 1
+  fi
+  if ssh_banner_ready; then
+    SSH_READY=1
+    break
+  fi
+  sleep 1
+done
+
+if (( ! SSH_READY )); then
+  log "SSH is not ready yet. VM '$VM_NAME' remains running."
+  log "Serial log: $SERIAL_LOG"
+  log "QEMU log: $QEMU_LOG"
+  log "Try again later with: ssh -p $PORT -o UserKnownHostsFile='$KNOWN_HOSTS' -o StrictHostKeyChecking=accept-new ubuntu@127.0.0.1"
+  exit 1
+fi
+
+SSH_ARGS=(-p "$PORT" -o "UserKnownHostsFile=$KNOWN_HOSTS" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
+PRIVATE_KEY="${PUBKEY_PATH%.pub}"
+if [[ -f "$PRIVATE_KEY" ]]; then
+  SSH_ARGS+=(-i "$PRIVATE_KEY" -o IdentitiesOnly=yes)
+fi
+
+printf '\n'
+log "Connected command: ssh -p $PORT -o UserKnownHostsFile='$KNOWN_HOSTS' -o StrictHostKeyChecking=accept-new ubuntu@127.0.0.1"
+log "Disconnecting from SSH will leave the VM running."
+log "To destroy this instance: dvm-shred $VM_NAME"
+printf '\n'
+set +e
+ssh "${SSH_ARGS[@]}" "ubuntu@127.0.0.1"
+ssh_rc=$?
+set -e
+printf '\n'
+log "SSH session ended. VM '$VM_NAME' is still running on port $PORT."
+log "Reconnect: ssh -p $PORT -o UserKnownHostsFile='$KNOWN_HOSTS' -o StrictHostKeyChecking=accept-new ubuntu@127.0.0.1"
+log "Destroy this VM: dvm-shred $VM_NAME | Destroy all: dvm-shred --all"
+exit "$ssh_rc"

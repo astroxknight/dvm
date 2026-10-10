@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+NAME="${1:?Usage: dvm-ssh INSTANCE_NAME}"
+DIR="$HOME/.local/state/dvm/$NAME"
+
+if [[ ! -f "$DIR/port" ]]; then
+    echo "Instance not found: $NAME" >&2
+    exit 1
+fi
+
+PORT="$(<"$DIR/port")"
+
+exec ssh -p "$PORT" \
+    -o UserKnownHostsFile="$DIR/known_hosts" \
+    -o StrictHostKeyChecking=accept-new \
+    "ubuntu@127.0.0.1"
