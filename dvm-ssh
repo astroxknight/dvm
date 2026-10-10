@@ -2,7 +2,8 @@
 set -euo pipefail
 
 NAME="${1:?Usage: dvm-ssh INSTANCE_NAME}"
-DIR="$HOME/.local/state/dvm/$NAME"
+STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/dvm"
+DIR="$STATE_ROOT/$NAME"
 
 if [[ ! -f "$DIR/port" ]]; then
     echo "Instance not found: $NAME" >&2
